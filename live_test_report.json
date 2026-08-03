@@ -1,0 +1,25 @@
+{
+  "test_date": "2026-08-03",
+  "target_stock": "AAPL",
+  "last_close": 306.83,
+  "predicted_price": 37.76,
+  "predicted_change": -87.69,
+  "signal": "STRONG SELL",
+  "rsi": 42.09,
+  "macd": 4.807,
+  "bb_support": 303.07,
+  "bb_resistance": 345.08,
+  "backtest_metrics": {
+    "days": 14,
+    "rmse": 288.8091,
+    "mae": 288.6516,
+    "mape": 87.9607,
+    "r2": -894.6343,
+    "directional_accuracy": 38.46,
+    "within_1pct": 0.0,
+    "within_2pct": 0.0,
+    "within_5pct": 0.0,
+    "grade": "NEEDS RETRAINING"
+  },
+  "multi_stock": {}
+}

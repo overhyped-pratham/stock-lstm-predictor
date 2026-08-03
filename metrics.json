@@ -1,0 +1,8 @@
+{
+  "ticker": "AAPL",
+  "rmse": 117.9509,
+  "mae": 116.5313,
+  "mape": 72.259,
+  "r2": -39.2887,
+  "directional_accuracy": 51.69
+}

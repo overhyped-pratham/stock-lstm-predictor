@@ -1,0 +1,14 @@
+{
+  "target_stock": "AAPL",
+  "last_close_price": 333.43,
+  "next_day_pred_price": 333.58,
+  "expected_return_pct": 0.05000000074505806,
+  "signal": "BUY",
+  "metrics": {
+    "rmse": 4.3245,
+    "mae": 2.9707,
+    "mape": 1.222,
+    "r2_score": 0.9837,
+    "directional_accuracy_pct": 52.89
+  }
+}
