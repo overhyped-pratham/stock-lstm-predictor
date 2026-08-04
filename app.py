@@ -3,21 +3,121 @@ import sys
 import json
 import datetime
 import warnings
+import zipfile
+import io
+import h5py
 import numpy as np
 import pandas as pd
 import joblib
+
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 warnings.filterwarnings('ignore')
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 import yfinance as yf
-import tensorflow as tf
-from tensorflow.keras.models import load_model
 
+# ── Pure NumPy LSTM Model Engine (Zero TensorFlow DLL Dependency) ──────────
+class NumpyLSTMModel:
+    def __init__(self, keras_model_path):
+        self.weights = {}
+        with zipfile.ZipFile(keras_model_path, 'r') as z:
+            with h5py.File(io.BytesIO(z.read('model.weights.h5')), 'r') as f:
+                def extract_weights(name, obj):
+                    if isinstance(obj, h5py.Dataset):
+                        if obj.shape == ():
+                            self.weights[name] = obj[()]
+                        else:
+                            self.weights[name] = obj[:]
+                f.visititems(extract_weights)
+        print(f"Extracted {len(self.weights)} weight tensors from Keras model.")
+
+    @staticmethod
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
+
+    def _run_lstm(self, x_seq, kernel, rec_kernel, bias, go_backwards=False):
+        units = rec_kernel.shape[0]
+        h = np.zeros(units, dtype=np.float32)
+        c = np.zeros(units, dtype=np.float32)
+        seq = x_seq[::-1] if go_backwards else x_seq
+        outputs = []
+        for t in range(seq.shape[0]):
+            x_t = seq[t]
+            z = np.dot(x_t, kernel) + np.dot(h, rec_kernel) + bias
+            i_g = self._sigmoid(z[0:units])
+            f_g = self._sigmoid(z[units:2*units])
+            c_g = np.tanh(z[2*units:3*units])
+            o_g = self._sigmoid(z[3*units:4*units])
+            c = f_g * c + i_g * c_g
+            h = o_g * np.tanh(c)
+            outputs.append(h)
+        if go_backwards:
+            outputs = outputs[::-1]
+        return np.array(outputs, dtype=np.float32)
+
+    @staticmethod
+    def _run_bn(x, gamma, beta, mean, var, eps=1e-3):
+        return gamma * (x - mean) / np.sqrt(var + eps) + beta
+
+    def predict_one(self, x_seq):
+        # x_seq shape: (60, 18)
+        # 1. BiLSTM 128
+        fw_k1 = self.weights['layers/bidirectional/forward_layer/cell/vars/0']
+        fw_r1 = self.weights['layers/bidirectional/forward_layer/cell/vars/1']
+        fw_b1 = self.weights['layers/bidirectional/forward_layer/cell/vars/2']
+        bw_k1 = self.weights['layers/bidirectional/backward_layer/cell/vars/0']
+        bw_r1 = self.weights['layers/bidirectional/backward_layer/cell/vars/1']
+        bw_b1 = self.weights['layers/bidirectional/backward_layer/cell/vars/2']
+
+        out_fw1 = self._run_lstm(x_seq, fw_k1, fw_r1, fw_b1, False)
+        out_bw1 = self._run_lstm(x_seq, bw_k1, bw_r1, bw_b1, True)
+        out_bilstm1 = np.concatenate([out_fw1, out_bw1], axis=-1)
+
+        # 2. BatchNorm 1
+        bn_g1 = self.weights['layers/batch_normalization/vars/0']
+        bn_b1 = self.weights['layers/batch_normalization/vars/1']
+        bn_m1 = self.weights['layers/batch_normalization/vars/2']
+        bn_v1 = self.weights['layers/batch_normalization/vars/3']
+        out_bn1 = self._run_bn(out_bilstm1, bn_g1, bn_b1, bn_m1, bn_v1)
+
+        # 3. BiLSTM 64
+        fw_k2 = self.weights['layers/bidirectional_1/forward_layer/cell/vars/0']
+        fw_r2 = self.weights['layers/bidirectional_1/forward_layer/cell/vars/1']
+        fw_b2 = self.weights['layers/bidirectional_1/forward_layer/cell/vars/2']
+        bw_k2 = self.weights['layers/bidirectional_1/backward_layer/cell/vars/0']
+        bw_r2 = self.weights['layers/bidirectional_1/backward_layer/cell/vars/1']
+        bw_b2 = self.weights['layers/bidirectional_1/backward_layer/cell/vars/2']
+
+        out_fw2 = self._run_lstm(out_bn1, fw_k2, fw_r2, fw_b2, False)[-1]
+        out_bw2 = self._run_lstm(out_bn1, bw_k2, bw_r2, bw_b2, True)[0]
+        out_bilstm2 = np.concatenate([out_fw2, out_bw2], axis=-1)
+
+        # 4. BatchNorm 2
+        bn_g2 = self.weights['layers/batch_normalization_1/vars/0']
+        bn_b2 = self.weights['layers/batch_normalization_1/vars/1']
+        bn_m2 = self.weights['layers/batch_normalization_1/vars/2']
+        bn_v2 = self.weights['layers/batch_normalization_1/vars/3']
+        out_bn2 = self._run_bn(out_bilstm2, bn_g2, bn_b2, bn_m2, bn_v2)
+
+        # 5. Dense 1 (32)
+        d_w1 = self.weights['layers/dense/vars/0']
+        d_b1 = self.weights['layers/dense/vars/1']
+        out_d1 = np.maximum(0, np.dot(out_bn2, d_w1) + d_b1)
+
+        # 6. Dense 2 (1)
+        d_w2 = self.weights['layers/dense_1/vars/0']
+        d_b2 = self.weights['layers/dense_1/vars/1']
+        out_final = np.dot(out_d1, d_w2) + d_b2
+        return float(out_final[0])
+
+# ── App Setup ─────────────────────────────────────────────────────────────
 app = FastAPI(title="Stock Market LSTM AI Predictor")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,9 +132,9 @@ if not os.path.exists(MODEL_PATH):
     SCALER_PATH = os.path.join(BASE_DIR, 'feature_scaler.pkl')
 
 print(f"Loading model from: {MODEL_PATH}")
-model = load_model(MODEL_PATH)
+model = NumpyLSTMModel(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)
-print("✅ Model & Scaler loaded successfully!")
+print("Model & Scaler loaded successfully!")
 
 metrics_data = {
     "rmse": 4.32,
@@ -102,11 +202,12 @@ def compute_native_features(df_in):
     feat.dropna(inplace=True)
     return feat
 
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, 'templates'))
+INDEX_HTML = os.path.join(BASE_DIR, 'templates', 'index.html')
 
 @app.get('/', response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse('index.html', {'request': request, 'metrics': metrics_data})
+def index():
+    with open(INDEX_HTML, 'r', encoding='utf-8') as f:
+        return HTMLResponse(content=f.read())
 
 @app.get('/api/predict')
 def get_predict(ticker: str = 'AAPL'):
@@ -128,7 +229,7 @@ def get_predict(ticker: str = 'AAPL'):
         # Live Next Day Prediction
         latest_raw = feat_df[FEATURE_COLS].values[-SEQ_LEN:]
         latest_scaled = scaler.transform(latest_raw)
-        pred_return = model.predict(latest_scaled[np.newaxis], verbose=0)[0, 0]
+        pred_return = model.predict_one(latest_scaled)
         
         last_close = float(feat_df['Close'].iloc[-1])
         last_date = feat_df.index[-1].strftime('%Y-%m-%d')
@@ -153,7 +254,7 @@ def get_predict(ticker: str = 'AAPL'):
             act = float(feat_df['Close'].iloc[idx + 1])
             d_str = feat_df.index[idx + 1].strftime('%Y-%m-%d')
             
-            p_ret = float(model.predict(win[np.newaxis], verbose=0)[0, 0])
+            p_ret = float(model.predict_one(win))
             prev_c = float(feat_df['Close'].iloc[idx])
             p_close = float(prev_c * (1.0 + p_ret))
             
